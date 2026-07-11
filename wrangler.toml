@@ -1,0 +1,16 @@
+name = "lnf-label-worker"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# After running:
+#   wrangler kv:namespace create LNF_SETTINGS
+#   wrangler kv:namespace create LNF_JOBS
+# paste the returned "id" values below.
+
+[[kv_namespaces]]
+binding = "LNF_SETTINGS"
+id = "REPLACE_WITH_LNF_SETTINGS_ID"
+
+[[kv_namespaces]]
+binding = "LNF_JOBS"
+id = "REPLACE_WITH_LNF_JOBS_ID"

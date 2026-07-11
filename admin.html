@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin &mdash; Lost & Found Label Printer</title>
+<style>
+:root {
+  --bg:#0d0d0f; --surface:#17171a; --surface2:#1e1e22; --border:#2a2a30;
+  --border-hover:#3a3a42; --accent:#f5a11e; --accent-dim:#f5a11e22;
+  --text:#f0f0f2; --text-dim:#8a8a92; --text-faint:#55555c;
+  --danger:#ef5350; --danger-bg:#2a1516; --success:#4caf50; --success-bg:#132a16;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body {
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Arial,sans-serif;
+  background:var(--bg); color:var(--text); min-height:100vh;
+  display:flex; flex-direction:column; align-items:center;
+  padding:48px 16px; letter-spacing:-0.01em;
+}
+.wrap { width:100%; max-width:480px; }
+.brand { display:flex; flex-direction:column; align-items:center; margin-bottom:24px; }
+.brand .title { font-size:19px; font-weight:700; }
+.brand .kicker {
+  color:var(--text-faint); font-size:11px; letter-spacing:2px; text-transform:uppercase;
+  margin-top:8px; font-weight:600;
+}
+.badge-admin {
+  display:inline-flex; align-items:center; gap:5px; background:var(--accent-dim);
+  color:var(--accent); font-size:10.5px; font-weight:700; padding:3px 10px;
+  border-radius:20px; letter-spacing:0.5px; text-transform:uppercase; margin-top:10px;
+}
+.card {
+  background:var(--surface); border:1px solid var(--border); border-radius:16px;
+  padding:28px; box-shadow:0 1px 0 rgba(255,255,255,0.02) inset, 0 20px 60px -20px rgba(0,0,0,0.6);
+  margin-bottom:16px;
+}
+.section-title {
+  font-size:11px; font-weight:700; color:var(--text-dim); text-transform:uppercase;
+  letter-spacing:0.8px; margin-bottom:14px; display:flex; align-items:center; gap:8px;
+}
+.field { margin-bottom:16px; }
+.field:last-child { margin-bottom:0; }
+.field label {
+  display:block; font-size:11px; font-weight:700; color:var(--text-dim);
+  text-transform:uppercase; letter-spacing:0.8px; margin-bottom:7px;
+}
+input {
+  width:100%; padding:11px 13px; border:1px solid var(--border); border-radius:9px;
+  font-size:14.5px; font-family:inherit; color:var(--text); background:var(--surface2);
+  transition:border-color .15s, background .15s;
+}
+input:hover { border-color:var(--border-hover); }
+input:focus { outline:none; border-color:var(--accent); background:#212125; }
+.hint { font-size:11px; color:var(--text-faint); margin-top:6px; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.btn {
+  width:100%; background:var(--accent); color:#14100a; border:none; border-radius:10px;
+  padding:14px; font-size:14.5px; font-weight:700; cursor:pointer;
+  transition:filter .15s, transform .1s; letter-spacing:0.2px;
+}
+.btn:hover { filter:brightness(1.08); }
+.btn:active { transform:scale(0.99); }
+.btn:disabled { background:var(--surface2); color:var(--text-faint); cursor:not-allowed; }
+.btn-secondary {
+  background:var(--surface2); color:var(--text); border:1px solid var(--border);
+}
+.btn-secondary:hover { filter:none; border-color:var(--border-hover); }
+.msg {
+  margin-top:14px; padding:12px 16px; border-radius:10px; font-size:13px;
+  font-weight:600; display:none; border:1px solid transparent;
+}
+.msg.ok { background:var(--success-bg); color:var(--success); border-color:#1e4620; display:flex; align-items:center; gap:8px; }
+.msg.err { background:var(--danger-bg); color:var(--danger); border-color:#4a2224; display:flex; align-items:center; gap:8px; }
+.footer {
+  margin-top:8px; display:flex; align-items:center; justify-content:center; gap:14px;
+  color:var(--text-faint); font-size:11.5px; letter-spacing:0.2px;
+}
+.footer a { color:var(--text-faint); text-decoration:none; }
+.footer a:hover { color:var(--text-dim); }
+.footer .dot { opacity:0.4; }
+.login-card { text-align:center; }
+.login-card .field { text-align:left; margin-top:20px; }
+.reveal-key {
+  display:flex; gap:8px;
+}
+.reveal-key input { flex:1; }
+.reveal-key button {
+  background:var(--surface2); border:1px solid var(--border); border-radius:9px;
+  color:var(--text-dim); font-size:12px; padding:0 14px; cursor:pointer; white-space:nowrap;
+}
+.reveal-key button:hover { border-color:var(--border-hover); color:var(--text); }
+</style>
+</head>
+<body>
+
+<div class="wrap" id="loginView" style="display:none">
+  <div class="brand">
+    <div class="title">Admin panel</div>
+    <div class="kicker">Lost &amp; Found Label Printer</div>
+  </div>
+  <div class="card login-card">
+    <div id="loginMsg" class="msg err"></div>
+    <div class="field">
+      <label>Admin password</label>
+      <input type="password" id="loginPassword" placeholder="Enter admin password">
+    </div>
+    <button class="btn" onclick="doLogin()">Sign in</button>
+  </div>
+  <div class="footer"><a href="index.html">&larr; Back to label printer</a></div>
+</div>
+
+<div class="wrap" id="appView" style="display:none">
+  <div class="brand">
+    <div class="title">Admin panel</div>
+    <div class="kicker">Lost &amp; Found Label Printer</div>
+    <div class="badge-admin">Admin session active</div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Label numbering</div>
+    <div class="grid2">
+      <div class="field">
+        <label>Year prefix</label>
+        <input type="text" id="prefix" placeholder="26" maxlength="4">
+        <div class="hint">Used as XX- in every code, e.g. 26-0570</div>
+      </div>
+      <div class="field">
+        <label>Max label number</label>
+        <input type="number" id="maxLabelNumber" placeholder="9999">
+      </div>
+    </div>
+    <div class="field">
+      <label>Max quantity per batch</label>
+      <input type="number" id="maxQuantity" placeholder="100">
+      <div class="hint">Caps how many labels can be queued in a single print job</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Access</div>
+    <div class="field">
+      <label>Staff/student login password</label>
+      <input type="text" id="userPassword" placeholder="Leave blank to keep unchanged">
+      <div class="hint">Used at the main label printer login screen</div>
+    </div>
+    <div class="field">
+      <label>Admin password</label>
+      <input type="text" id="adminPassword" placeholder="Leave blank to keep unchanged">
+      <div class="hint">Used to access this panel</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Print server connection</div>
+    <div class="field">
+      <label>Poller API key</label>
+      <div class="reveal-key">
+        <input type="password" id="pollerApiKey" placeholder="Leave blank to keep unchanged">
+        <button type="button" onclick="toggleKeyVisibility()">Show</button>
+      </div>
+      <div class="hint">Shared secret the print-server poller uses to fetch and complete jobs. Changing this requires updating label_poller.py on the print server too.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Site</div>
+    <div class="field">
+      <label>Site title</label>
+      <input type="text" id="siteTitle" placeholder="Lost & Found Label Printer">
+    </div>
+  </div>
+
+  <button class="btn" id="saveBtn" onclick="saveSettings()">Save changes</button>
+  <div class="msg" id="msg"></div>
+
+  <div class="footer">
+    <a href="index.html">&larr; Back to label printer</a>
+    <span class="dot">&bull;</span>
+    <a href="#" onclick="doLogout();return false;">Sign out</a>
+  </div>
+</div>
+
+<script>
+const API = "https://lnf-labels-api.YOUR-SUBDOMAIN.workers.dev";
+let TOKEN = localStorage.getItem("lnf_admin_token") || null;
+
+async function init() {
+  if (!TOKEN) { showLogin(); return; }
+  const ok = await loadSettings();
+  if (ok) { showApp(); } else { showLogin(); }
+}
+
+function showLogin() {
+  document.getElementById("loginView").style.display = "block";
+  document.getElementById("appView").style.display = "none";
+}
+
+function showApp() {
+  document.getElementById("loginView").style.display = "none";
+  document.getElementById("appView").style.display = "block";
+}
+
+async function doLogin() {
+  const password = document.getElementById("loginPassword").value;
+  const msg = document.getElementById("loginMsg");
+  msg.style.display = "none";
+  try {
+    const r = await fetch(API + "/api/admin/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: password })
+    });
+    const data = await r.json();
+    if (data.success) {
+      TOKEN = data.token;
+      localStorage.setItem("lnf_admin_token", TOKEN);
+      const ok = await loadSettings();
+      if (ok) showApp();
+    } else {
+      msg.textContent = data.error || "Login failed.";
+      msg.style.display = "flex";
+    }
+  } catch (e) {
+    msg.textContent = "Could not reach the server.";
+    msg.style.display = "flex";
+  }
+}
+
+function doLogout() {
+  localStorage.removeItem("lnf_admin_token");
+  TOKEN = null;
+  showLogin();
+}
+
+async function loadSettings() {
+  try {
+    const r = await fetch(API + "/api/settings", {
+      headers: { "Authorization": "Bearer " + TOKEN }
+    });
+    if (r.status === 401 || r.status === 403) {
+      localStorage.removeItem("lnf_admin_token"); TOKEN = null; return false;
+    }
+    const data = await r.json();
+    if (data.success) {
+      const s = data.settings;
+      document.getElementById("prefix").value = s.prefix || "";
+      document.getElementById("maxLabelNumber").value = s.maxLabelNumber || "";
+      document.getElementById("maxQuantity").value = s.maxQuantity || "";
+      document.getElementById("siteTitle").value = s.siteTitle || "";
+      return true;
+    }
+    return false;
+  } catch (e) { return false; }
+}
+
+function toggleKeyVisibility() {
+  const input = document.getElementById("pollerApiKey");
+  input.type = input.type === "password" ? "text" : "password";
+}
+
+async function saveSettings() {
+  const btn = document.getElementById("saveBtn");
+  const msg = document.getElementById("msg");
+  msg.className = "msg";
+
+  const payload = {
+    prefix: document.getElementById("prefix").value.trim(),
+    maxLabelNumber: document.getElementById("maxLabelNumber").value.trim(),
+    maxQuantity: document.getElementById("maxQuantity").value.trim(),
+    siteTitle: document.getElementById("siteTitle").value.trim(),
+  };
+  const userPw = document.getElementById("userPassword").value.trim();
+  const adminPw = document.getElementById("adminPassword").value.trim();
+  const pollerKey = document.getElementById("pollerApiKey").value.trim();
+  if (userPw) payload.userPassword = userPw;
+  if (adminPw) payload.adminPassword = adminPw;
+  if (pollerKey) payload.pollerApiKey = pollerKey;
+
+  btn.disabled = true;
+  btn.textContent = "Saving...";
+
+  try {
+    const r = await fetch(API + "/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + TOKEN },
+      body: JSON.stringify(payload)
+    });
+    const data = await r.json();
+    if (data.success) {
+      msg.className = "msg ok";
+      msg.textContent = "Settings saved successfully.";
+      msg.style.display = "flex";
+      document.getElementById("userPassword").value = "";
+      document.getElementById("adminPassword").value = "";
+      document.getElementById("pollerApiKey").value = "";
+    } else {
+      msg.className = "msg err";
+      msg.textContent = data.error || "Save failed.";
+      msg.style.display = "flex";
+    }
+  } catch (e) {
+    msg.className = "msg err";
+    msg.textContent = "Could not reach the server.";
+    msg.style.display = "flex";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Save changes";
+  }
+}
+
+init();
+</script>
+</body>
+</html>
