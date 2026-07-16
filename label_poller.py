@@ -18,7 +18,7 @@ import pyautogui, psutil
 import win32gui, win32con
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-WORKER_URL    = "https://lnf-labels-api.YOUR-SUBDOMAIN.workers.dev"
+WORKER_URL    = "https://lf-label-printer.david-pedersen.workers.dev"
 POLLER_KEY    = "change-me-poller-key"     # Must match pollerApiKey in admin panel
 TEMPLATE_PATH = r"C:\Users\1\Desktop\Item Code Layout (1).lbx"
 PTOUCH_CSV    = r"C:\Users\1\Desktop\p_touch_clean_database.csv"
