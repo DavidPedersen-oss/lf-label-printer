@@ -2,6 +2,12 @@ name = "lf-label-printer"
 main = "worker.js"
 compatibility_date = "2026-01-01"
 
+# Static assets -- the Worker serves the HTML files in ./public directly.
+# Requests for /, /index.html, /admin.html are served from public/.
+# Anything not matching a static file (e.g. /api/*) falls through to worker.js.
+[assets]
+directory = "./public"
+
 # After running:
 #   wrangler kv:namespace create LNF_SETTINGS
 #   wrangler kv:namespace create LNF_JOBS
