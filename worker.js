@@ -175,6 +175,31 @@ export default {
       return json({ success: true, jobId, message: "Print job queued." });
     }
 
+    // ---- Poller: heartbeat (lets the admin panel show poller health) ----
+    if (path === "/api/poller/heartbeat" && request.method === "POST") {
+      const key = request.headers.get("X-Poller-Key");
+      const settings = await getSettings(env);
+      if (key !== settings.pollerApiKey) return json({ error: "Invalid poller key." }, 403);
+      await env.LNF_SETTINGS.put("poller:lastSeen", new Date().toISOString(), {
+        expirationTtl: 60 * 10, // if no heartbeat in 10 min, considered offline
+      });
+      return json({ success: true });
+    }
+
+    // ---- Poller status (admin panel reads this) ----
+    if (path === "/api/poller/status" && request.method === "GET") {
+      const session = await requireAdminSession(request, env);
+      if (!session) return json({ error: "Admin authentication required." }, 403);
+      const lastSeen = await env.LNF_SETTINGS.get("poller:lastSeen");
+      const list = await env.LNF_JOBS.list({ prefix: "pending:" });
+      return json({
+        success: true,
+        online: !!lastSeen,
+        lastSeen,
+        pendingJobs: list.keys.length,
+      });
+    }
+
     // ---- Poller: list pending jobs ----
     if (path === "/api/jobs/pending" && request.method === "GET") {
       const key = request.headers.get("X-Poller-Key");

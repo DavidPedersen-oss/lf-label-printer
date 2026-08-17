@@ -18,7 +18,7 @@ import pyautogui, psutil
 import win32gui, win32con
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-WORKER_URL    = "https://lf-label-printer.david-pedersen.workers.dev"
+WORKER_URL    = "https://lnf-labels-api.YOUR-SUBDOMAIN.workers.dev"
 POLLER_KEY    = "change-me-poller-key"     # Must match pollerApiKey in admin panel
 TEMPLATE_PATH = r"C:\Users\1\Desktop\Item Code Layout (1).lbx"
 PTOUCH_CSV    = r"C:\Users\1\Desktop\p_touch_clean_database.csv"
@@ -33,6 +33,8 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("LabelPoller")
 
 
+_last_conn_state = {"ok": True, "last_logged": 0, "fail_count": 0}
+
 def fetch_pending_jobs():
     try:
         r = requests.get(
@@ -41,13 +43,53 @@ def fetch_pending_jobs():
             timeout=10,
         )
         if r.status_code != 200:
-            log.warning(f"Poll failed: {r.status_code} {r.text}")
+            _note_connection(False, f"HTTP {r.status_code}: {r.text}")
             return []
         data = r.json()
+        _note_connection(True)
         return data.get("jobs", [])
     except Exception as e:
-        log.error(f"Poll error: {e}")
+        _note_connection(False, str(e))
         return []
+
+
+def _note_connection(ok, error=None):
+    """Log connection state transitions instead of spamming every failed
+    poll -- the print server's network drops intermittently, so this keeps
+    the log readable while still recording how long an outage lasted."""
+    now = time.time()
+    if ok:
+        if not _last_conn_state["ok"]:
+            down_for = now - _last_conn_state["last_logged"]
+            log.info(f"Reconnected to Worker after {down_for:.0f}s offline "
+                      f"({_last_conn_state['fail_count']} failed polls).")
+        _last_conn_state["ok"] = True
+        _last_conn_state["fail_count"] = 0
+    else:
+        _last_conn_state["fail_count"] += 1
+        if _last_conn_state["ok"]:
+            # Just went down -- log immediately.
+            log.error(f"Lost connection to Worker: {error}")
+            _last_conn_state["last_logged"] = now
+            _last_conn_state["ok"] = False
+        elif now - _last_conn_state.get("_last_repeat_log", 0) > 300:
+            # Still down -- only re-log every 5 minutes to avoid spam.
+            log.warning(f"Still offline ({_last_conn_state['fail_count']} "
+                        f"failed polls so far): {error}")
+            _last_conn_state["_last_repeat_log"] = now
+
+
+def send_heartbeat():
+    """Let the Worker know the poller is alive so the admin panel can show
+    real status instead of leaving Dave guessing whether it's running."""
+    try:
+        requests.post(
+            f"{WORKER_URL}/api/poller/heartbeat",
+            headers={"X-Poller-Key": POLLER_KEY},
+            timeout=8,
+        )
+    except Exception:
+        pass  # Heartbeat failures aren't critical -- next poll will retry.
 
 
 def mark_complete(job_id):
@@ -73,14 +115,25 @@ def mark_failed(job_id, error):
         log.error(f"Failed to mark job failed: {e}")
 
 
-def write_csv(rcv_fmt, exp_fmt, prefix, start, quantity):
+def write_csv(rcv_fmt, exp_fmt, prefix, start, quantity, retries=6, delay=1.0):
     lines = ["Exp Date,Code,ReceivedDate"]
     for i in range(quantity):
         code = f"{prefix}-{str(start + i).zfill(4)}"
         lines.append(f"{exp_fmt},{code},{rcv_fmt}")
-    with open(PTOUCH_CSV, "w", newline="") as f:
-        f.write("\r\n".join(lines) + "\r\n")
-    log.info(f"CSV written: {quantity} row(s)  |  {prefix}-{str(start).zfill(4)} to {prefix}-{str(start+quantity-1).zfill(4)}")
+    content = "\r\n".join(lines) + "\r\n"
+
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            with open(PTOUCH_CSV, "w", newline="") as f:
+                f.write(content)
+            log.info(f"CSV written: {quantity} row(s)  |  {prefix}-{str(start).zfill(4)} to {prefix}-{str(start+quantity-1).zfill(4)}")
+            return
+        except PermissionError as e:
+            last_err = e
+            log.warning(f"CSV locked (attempt {attempt}/{retries}), retrying in {delay}s...")
+            time.sleep(delay)
+    raise RuntimeError(f"Could not write CSV after {retries} attempts: {last_err}")
 
 
 def kill_ptouch():
@@ -126,7 +179,6 @@ def focus_window(hwnd):
 
 
 def automate_print():
-    kill_ptouch()
     log.info(f"Opening template: {TEMPLATE_PATH}")
     os.startfile(TEMPLATE_PATH)
 
@@ -145,7 +197,7 @@ def automate_print():
     time.sleep(2.5)
 
     print_dlg = None
-    for _ in range(10):
+    for _ in range(20):
         print_dlg = win32gui.FindWindow(None, "Print")
         if print_dlg:
             break
@@ -184,8 +236,30 @@ def automate_print():
         else:
             pyautogui.press("enter")
     else:
-        log.warning("Print dialog not found, pressing Enter as fallback...")
-        pyautogui.press("enter")
+        # Retry once rather than blindly pressing Enter on an unknown window --
+        # a stray Enter could hit the wrong control and silently under-print.
+        log.warning("Print dialog not found on first try, retrying Ctrl+P once...")
+        pyautogui.hotkey("ctrl", "p")
+        time.sleep(3)
+        print_dlg = win32gui.FindWindow(None, "Print")
+        if print_dlg:
+            buttons = []
+            def enum_cb2(h, _):
+                if win32gui.GetClassName(h) == "Button":
+                    buttons.append((h, win32gui.GetWindowText(h)))
+            win32gui.EnumChildWindows(print_dlg, enum_cb2, None)
+            all_h = next((h for h, t in buttons if t.replace('&','').lower().startswith('all records')), None)
+            print_h = next((h for h, t in buttons if t.replace('&','').lower() == 'print'), None)
+            win32api = __import__("win32api")
+            if all_h:
+                win32api.SendMessage(all_h, win32con.BM_CLICK, 0, 0)
+                time.sleep(0.3)
+            if print_h:
+                win32api.SendMessage(print_h, win32con.BM_CLICK, 0, 0)
+            else:
+                raise RuntimeError("Print dialog reappeared but Print button not found -- aborting rather than guessing.")
+        else:
+            raise RuntimeError("Print dialog never appeared after two attempts -- job not printed.")
 
     time.sleep(4)
 
@@ -210,6 +284,10 @@ def process_job(job):
         ey, em, ed = job["exp"].split("-")
         exp_fmt = f"{int(em)}/{int(ed)}/{ey}"
 
+        # Kill any lingering P-touch instance FIRST so it releases the CSV
+        # file lock before we try to write to it (fixes intermittent
+        # PermissionError when jobs land back-to-back).
+        kill_ptouch()
         write_csv(rcv_fmt, exp_fmt, job["prefix"], job["start"], job["quantity"])
         automate_print()
         mark_complete(job_id)
@@ -227,10 +305,17 @@ def main():
     log.info(f"Poll every {POLL_INTERVAL}s")
     log.info("=" * 55)
 
+    last_heartbeat = 0
     while True:
         jobs = fetch_pending_jobs()
         for job in jobs:
             process_job(job)
+
+        # Heartbeat every ~30s, not every poll cycle -- keeps it lightweight.
+        if time.time() - last_heartbeat > 30:
+            send_heartbeat()
+            last_heartbeat = time.time()
+
         time.sleep(POLL_INTERVAL)
 
 

@@ -3,22 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23e08a00'/%3E%3Ctext x='50' y='71' font-family='Arial,sans-serif' font-size='62' font-weight='bold' fill='white' text-anchor='middle'%3EL%3C/temp%3E%3C/svg%3E">
 <title>Admin &mdash; Lost & Found Label Printer</title>
 <style>
 :root {
-  --bg:#f5f6f8; --surface:#ffffff; --surface2:#eef0f3; --border:#d8dbe0;
-  --border-hover:#c4c8cf; --accent:#e08a00; --accent-dim:#e08a0022;
-  --text:#1a1a1f; --text-dim:#5a5a64; --text-faint:#9a9aa4;
-  --danger:#d32f2f; --danger-bg:#fbe9e9; --success:#2e7d32; --success-bg:#e8f5e9;
-  --input-focus-bg:#ffffff;
-}
-[data-theme="dark"] {
   --bg:#0d0d0f; --surface:#17171a; --surface2:#1e1e22; --border:#2a2a30;
   --border-hover:#3a3a42; --accent:#f5a11e; --accent-dim:#f5a11e22;
   --text:#f0f0f2; --text-dim:#8a8a92; --text-faint:#55555c;
   --danger:#ef5350; --danger-bg:#2a1516; --success:#4caf50; --success-bg:#132a16;
-  --input-focus-bg:#212125;
 }
 * { box-sizing:border-box; margin:0; padding:0; }
 body {
@@ -34,6 +25,11 @@ body {
   color:var(--text-faint); font-size:11px; letter-spacing:2px; text-transform:uppercase;
   margin-top:8px; font-weight:600;
 }
+.status-dot {
+  display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px;
+}
+.status-dot.online { background:var(--success); box-shadow:0 0 8px var(--success); }
+.status-dot.offline { background:var(--danger); box-shadow:0 0 8px var(--danger); }
 .badge-admin {
   display:inline-flex; align-items:center; gap:5px; background:var(--accent-dim);
   color:var(--accent); font-size:10.5px; font-weight:700; padding:3px 10px;
@@ -60,7 +56,7 @@ input {
   transition:border-color .15s, background .15s;
 }
 input:hover { border-color:var(--border-hover); }
-input:focus { outline:none; border-color:var(--accent); background:var(--input-focus-bg); }
+input:focus { outline:none; border-color:var(--accent); background:#212125; }
 .hint { font-size:11px; color:var(--text-faint); margin-top:6px; }
 .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 .btn {
@@ -127,6 +123,11 @@ input:focus { outline:none; border-color:var(--accent); background:var(--input-f
   </div>
 
   <div class="card">
+    <div class="section-title">Print server status</div>
+    <div id="pollerStatus" style="font-size:13px;color:var(--text-dim)">Checking...</div>
+  </div>
+
+  <div class="card">
     <div class="section-title">Label numbering</div>
     <div class="grid2">
       <div class="field">
@@ -187,18 +188,11 @@ input:focus { outline:none; border-color:var(--accent); background:var(--input-f
     <a href="index.html">&larr; Back to label printer</a>
     <span class="dot">&bull;</span>
     <a href="#" onclick="doLogout();return false;">Sign out</a>
-    <span class="dot">&bull;</span>
-    <a href="#" id="themeToggle" onclick="toggleTheme();return false;">Theme</a>
   </div>
-</div>
 </div>
 
 <script>
-(function(){var t=localStorage.getItem("lnf_theme")||"light";document.documentElement.setAttribute("data-theme",t);})();
-function toggleTheme(){var cur=document.documentElement.getAttribute("data-theme")||"light";var next=cur==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next);localStorage.setItem("lnf_theme",next);updateThemeLabel();}
-function updateThemeLabel(){var el=document.getElementById("themeToggle");if(el){var cur=document.documentElement.getAttribute("data-theme")||"light";el.textContent="Theme: "+(cur==="dark"?"Dark":"Light");}}
-updateThemeLabel();
-const API = "https://lf-label-printer.david-pedersen.workers.dev";
+const API = "https://lnf-labels-api.YOUR-SUBDOMAIN.workers.dev";
 let TOKEN = localStorage.getItem("lnf_admin_token") || null;
 
 async function init() {
@@ -215,6 +209,8 @@ function showLogin() {
 function showApp() {
   document.getElementById("loginView").style.display = "none";
   document.getElementById("appView").style.display = "block";
+  loadPollerStatus();
+  setInterval(loadPollerStatus, 15000); // refresh every 15s while the panel is open
 }
 
 async function doLogin() {
@@ -246,6 +242,28 @@ function doLogout() {
   localStorage.removeItem("lnf_admin_token");
   TOKEN = null;
   showLogin();
+}
+
+async function loadPollerStatus() {
+  const el = document.getElementById("pollerStatus");
+  try {
+    const r = await fetch(API + "/api/poller/status", {
+      headers: { "Authorization": "Bearer " + TOKEN }
+    });
+    const data = await r.json();
+    if (!data.success) { el.textContent = "Could not check status."; return; }
+    if (data.online) {
+      const seenAgo = Math.round((Date.now() - new Date(data.lastSeen)) / 1000);
+      el.innerHTML = '<span class="status-dot online"></span>Online &middot; last check-in ' +
+        seenAgo + 's ago &middot; ' + data.pendingJobs + ' job(s) queued';
+    } else {
+      el.innerHTML = '<span class="status-dot offline"></span>Offline &mdash; poller has not checked in ' +
+        'within the last 10 minutes. Print jobs will queue until it reconnects.' +
+        (data.pendingJobs > 0 ? ' <strong>' + data.pendingJobs + ' job(s) currently waiting.</strong>' : '');
+    }
+  } catch (e) {
+    el.textContent = "Could not reach the server.";
+  }
 }
 
 async function loadSettings() {

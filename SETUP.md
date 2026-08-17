@@ -54,40 +54,35 @@ It'll print your Worker URL, something like:
 https://lnf-label-worker.YOUR-SUBDOMAIN.workers.dev
 ```
 
-Visit `https://lf-label-printer.david-pedersen.workers.dev/api/bootstrap`
-once in a browser -- this seeds the default settings (prefix `26`, password
-`lnf2026`, admin password `admin2026`). **Change these immediately in the
-admin panel after first login.**
+Visit `https://YOUR-WORKER-URL/api/bootstrap` once in a browser -- this seeds
+the default settings (prefix `26`, password `lnf2026`, admin password
+`admin2026`). **Change these immediately in the admin panel after first login.**
 
 ---
 
 ## Step 2 -- Point the frontend at your Worker
 
-The `API` constant inside `public/index.html` and `public/admin.html` has
-already been wired to the deployed Worker URL from Step 1:
+Open both `public/index.html` and `public/admin.html` and find this line near
+the top of the `<script>`:
 
 ```js
-const API = "https://lf-label-printer.david-pedersen.workers.dev";
+const API = "https://lnf-labels-api.YOUR-SUBDOMAIN.workers.dev";
 ```
+
+Replace it with your actual Worker URL from Step 1.
 
 ---
 
 ## Step 3 -- Deploy the frontend to Cloudflare Pages
 
-Create a Pages project connected to your GitHub repo (Workers Builds only
-deploys the Worker, not the static HTML). Use the Cloudflare dashboard:
+From the `lnf-cloudflare` folder:
 
-1. Cloudflare dashboard → Workers & Pages → Create application → Pages →
-   Connect to Git
-2. Pick the `DavidPedersen-oss/lf-label-printer` repository
-3. **Production branch:** `main`
-4. **Framework preset:** `None`
-5. **Build command:** (leave empty)
-6. **Build output directory:** `public`
-7. Click Save and Deploy
+```
+wrangler pages deploy public --project-name=lnf-labels
+```
 
-It'll give you a URL like `https://lf-label-printer.pages.dev` -- that's what
-you share with students and staff.
+It'll give you a URL like `https://lnf-labels.pages.dev` -- that's what you
+share with students and staff.
 
 (Optional) Add a custom domain/subdomain in the Cloudflare Pages dashboard
 under your project > Custom domains, e.g. `labels.yourdomain.com`.
@@ -103,12 +98,9 @@ pip install requests pyautogui pygetwindow pywin32 psutil
 Open `label_poller.py` and set:
 
 ```python
-WORKER_URL    = "https://lf-label-printer.david-pedersen.workers.dev"
-POLLER_KEY    = "change-me-poller-key"   # must match the admin panel's Poller API Key
+WORKER_URL = "https://lnf-label-worker.YOUR-SUBDOMAIN.workers.dev"
+POLLER_KEY = "change-me-poller-key"   # must match the admin panel's Poller API Key
 ```
-
-(`WORKER_URL` is already wired -- you only need to change `POLLER_KEY` after
-you set a real one in the admin panel.)
 
 Run it:
 
@@ -123,9 +115,9 @@ every few seconds and runs P-touch Editor automation exactly like before.
 
 ## Step 5 -- First login and admin setup
 
-1. Go to your Pages URL, e.g. `https://lf-label-printer.pages.dev`
+1. Go to your Pages URL, e.g. `https://lnf-labels.pages.dev`
 2. Log in with the default password `lnf2026`
-3. Go to `https://lf-label-printer.pages.dev/admin.html`
+3. Go to `https://lnf-labels.pages.dev/admin.html`
 4. Log in with the default admin password `admin2026`
 5. Set:
    - Year prefix (e.g. `26`)
