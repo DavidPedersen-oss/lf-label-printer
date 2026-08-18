@@ -41,6 +41,36 @@ function randomToken(len = 32) {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ---- Pending queue helpers ----
+// A single JSON array under one KV key, read/written with get/put instead
+// of KV.list() -- list() is capped at 1,000 ops/day on the free tier and
+// a poller checking every few seconds blows through that in hours. get/put
+// have much higher free-tier limits, so this scales fine for a small queue.
+async function getPendingQueue(env) {
+  const raw = await env.LNF_JOBS.get("queue:pending");
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function setPendingQueue(env, queue) {
+  await env.LNF_JOBS.put("queue:pending", JSON.stringify(queue));
+}
+
+async function addToPendingQueue(env, jobId) {
+  const queue = await getPendingQueue(env);
+  if (!queue.includes(jobId)) {
+    queue.push(jobId);
+    await setPendingQueue(env, queue);
+  }
+}
+
+async function removeFromPendingQueue(env, jobId) {
+  const queue = await getPendingQueue(env);
+  const filtered = queue.filter((id) => id !== jobId);
+  if (filtered.length !== queue.length) {
+    await setPendingQueue(env, filtered);
+  }
+}
+
 async function getSettings(env) {
   const raw = await env.LNF_SETTINGS.get("config");
   if (!raw) {
@@ -170,7 +200,7 @@ export default {
       await env.LNF_JOBS.put(`job:${jobId}`, JSON.stringify(job), {
         expirationTtl: 60 * 60 * 24, // auto-clean after 24h
       });
-      await env.LNF_JOBS.put(`pending:${jobId}`, "1", { expirationTtl: 60 * 60 * 24 });
+      await addToPendingQueue(env, jobId);
 
       return json({ success: true, jobId, message: "Print job queued." });
     }
@@ -181,7 +211,7 @@ export default {
       const settings = await getSettings(env);
       if (key !== settings.pollerApiKey) return json({ error: "Invalid poller key." }, 403);
       await env.LNF_SETTINGS.put("poller:lastSeen", new Date().toISOString(), {
-        expirationTtl: 60 * 10, // if no heartbeat in 10 min, considered offline
+        expirationTtl: 60 * 30, // if no heartbeat in 30 min, considered offline
       });
       return json({ success: true });
     }
@@ -191,25 +221,28 @@ export default {
       const session = await requireAdminSession(request, env);
       if (!session) return json({ error: "Admin authentication required." }, 403);
       const lastSeen = await env.LNF_SETTINGS.get("poller:lastSeen");
-      const list = await env.LNF_JOBS.list({ prefix: "pending:" });
+      const queue = await getPendingQueue(env);
       return json({
         success: true,
         online: !!lastSeen,
         lastSeen,
-        pendingJobs: list.keys.length,
+        pendingJobs: queue.length,
       });
     }
 
     // ---- Poller: list pending jobs ----
+    // Uses a single queue array (get/put) instead of KV.list() -- list()
+    // is capped at 1,000 ops/day on the free tier, which a 4s poll loop
+    // blows through in a few hours. get() has a 100,000/day free limit,
+    // so polling frequently this way is safe.
     if (path === "/api/jobs/pending" && request.method === "GET") {
       const key = request.headers.get("X-Poller-Key");
       const settings = await getSettings(env);
       if (key !== settings.pollerApiKey) return json({ error: "Invalid poller key." }, 403);
 
-      const list = await env.LNF_JOBS.list({ prefix: "pending:" });
+      const queue = await getPendingQueue(env);
       const jobs = [];
-      for (const entry of list.keys) {
-        const jobId = entry.name.replace("pending:", "");
+      for (const jobId of queue) {
         const raw = await env.LNF_JOBS.get(`job:${jobId}`);
         if (raw) jobs.push(JSON.parse(raw));
       }
@@ -231,7 +264,7 @@ export default {
       job.status = "printed";
       job.completedAt = new Date().toISOString();
       await env.LNF_JOBS.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 60 * 60 * 24 });
-      await env.LNF_JOBS.delete(`pending:${jobId}`);
+      await removeFromPendingQueue(env, jobId);
 
       return json({ success: true });
     }
@@ -251,7 +284,7 @@ export default {
       job.status = "failed";
       job.error = body.error || "Unknown error";
       await env.LNF_JOBS.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 60 * 60 * 24 });
-      await env.LNF_JOBS.delete(`pending:${jobId}`);
+      await removeFromPendingQueue(env, jobId);
 
       return json({ success: true });
     }

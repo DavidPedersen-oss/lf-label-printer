@@ -192,7 +192,7 @@ input:focus { outline:none; border-color:var(--accent); background:#212125; }
 </div>
 
 <script>
-const API = "https://lf-label-printer.david-pedersen.workers.dev";
+const API = "https://lnf-labels-api.YOUR-SUBDOMAIN.workers.dev";
 let TOKEN = localStorage.getItem("lnf_admin_token") || null;
 
 async function init() {
@@ -258,7 +258,7 @@ async function loadPollerStatus() {
         seenAgo + 's ago &middot; ' + data.pendingJobs + ' job(s) queued';
     } else {
       el.innerHTML = '<span class="status-dot offline"></span>Offline &mdash; poller has not checked in ' +
-        'within the last 10 minutes. Print jobs will queue until it reconnects.' +
+        'within the last 30 minutes. Print jobs will queue until it reconnects.' +
         (data.pendingJobs > 0 ? ' <strong>' + data.pendingJobs + ' job(s) currently waiting.</strong>' : '');
     }
   } catch (e) {
