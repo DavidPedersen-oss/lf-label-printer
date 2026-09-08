@@ -229,18 +229,16 @@ function getPrintParam() {
 }
 
 // If the page was opened with a ?print= link (e.g. clicked from Excel),
-// fill the form and submit it automatically -- one click = one print.
+// pre-fill the form with that code and let the user confirm with Print.
 function maybeAutoPrint() {
   const auto = getPrintParam();
   if (!auto) return;
   document.getElementById("start").value = auto.num;
   document.getElementById("qty").value = auto.qty;
   updatePreview();
-  const msg = document.getElementById("msg");
-  msg.className = "msg";
-  msg.style.display = "flex";
-  msg.textContent = "Auto-printing " + SETTINGS.prefix + "-" + pad4(auto.num) + "...";
-  sendPrint();
+  const btn = document.getElementById("btn");
+  btn.textContent = "Print " + SETTINGS.prefix + "-" + pad4(auto.num);
+  btn.focus();
 }
 
 async function doLogin() {
