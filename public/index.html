@@ -209,6 +209,38 @@ function showApp() {
   document.getElementById("loginView").style.display = "none";
   document.getElementById("appView").style.display = "block";
   setupForm();
+  maybeAutoPrint();
+}
+
+// Read a code/label number from the URL query string, e.g.
+//   ?print=26-1363     (full code, prefix ignored -- trailing number is used)
+//   ?print=1363        (bare number)
+//   ?print=26-1363&qty=2
+// Returns { num, qty } or null if there's nothing to auto-print.
+function getPrintParam() {
+  const p = new URLSearchParams(location.search);
+  const raw = p.get("print") || p.get("code") || p.get("start");
+  if (!raw) return null;
+  const digits = String(raw).includes("-") ? String(raw).split("-").pop() : raw;
+  const num = parseInt(digits, 10);
+  if (isNaN(num)) return null;
+  const qty = parseInt(p.get("qty") || "1", 10) || 1;
+  return { num: num, qty: qty };
+}
+
+// If the page was opened with a ?print= link (e.g. clicked from Excel),
+// fill the form and submit it automatically -- one click = one print.
+function maybeAutoPrint() {
+  const auto = getPrintParam();
+  if (!auto) return;
+  document.getElementById("start").value = auto.num;
+  document.getElementById("qty").value = auto.qty;
+  updatePreview();
+  const msg = document.getElementById("msg");
+  msg.className = "msg";
+  msg.style.display = "flex";
+  msg.textContent = "Auto-printing " + SETTINGS.prefix + "-" + pad4(auto.num) + "...";
+  sendPrint();
 }
 
 async function doLogin() {
