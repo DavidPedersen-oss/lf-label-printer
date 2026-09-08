@@ -11,6 +11,27 @@
   --text:#f0f0f2; --text-dim:#8a8a92; --text-faint:#55555c;
   --danger:#ef5350; --danger-bg:#2a1516; --success:#4caf50; --success-bg:#132a16;
 }
+:root[data-theme="light"] {
+  --bg:#f4f4f6; --surface:#ffffff; --surface2:#f0f0f2; --border:#e3e3e8;
+  --border-hover:#cfcfd6; --accent:#f5a11e; --accent-dim:#f5a11e22;
+  --text:#1a1a1e; --text-dim:#6a6a72; --text-faint:#9a9aa2;
+  --danger:#c62828; --danger-bg:#fbeaea; --success:#2e7d32; --success-bg:#e8f5e9;
+}
+:root[data-theme="light"] input:focus { background:#ffffff; }
+:root[data-theme="light"] input.readonly { background:#f0f0f2; }
+:root[data-theme="light"] .card { box-shadow:0 1px 2px rgba(0,0,0,0.04), 0 12px 32px -16px rgba(0,0,0,0.18); }
+:root[data-theme="light"] .msg.ok { border-color:#b7dfba; }
+:root[data-theme="light"] .msg.err { border-color:#eec2c2; }
+:root[data-theme="light"] .tag-chip .exp { color:#c0504d; }
+.theme-toggle {
+  position:fixed; top:16px; right:16px; z-index:50;
+  width:38px; height:38px; border-radius:10px;
+  background:var(--surface); border:1px solid var(--border);
+  color:var(--text); font-size:16px; cursor:pointer; line-height:1;
+  display:flex; align-items:center; justify-content:center;
+  transition:border-color .15s, background .15s;
+}
+.theme-toggle:hover { border-color:var(--border-hover); }
 * { box-sizing:border-box; margin:0; padding:0; }
 body {
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Arial,sans-serif;
@@ -112,8 +133,19 @@ input.readonly { background:#191919; color:var(--text-dim); }
 }
 @keyframes spin { to { transform:rotate(360deg); } }
 </style>
+<script>
+  // Apply saved theme before paint to avoid a flash of the wrong mode.
+  (function () {
+    try {
+      var t = localStorage.getItem("lnf_theme");
+      if (t === "light") document.documentElement.setAttribute("data-theme", "light");
+    } catch (e) {}
+  })();
+</script>
 </head>
 <body>
+
+<button id="themeToggle" class="theme-toggle" onclick="toggleTheme()" title="Toggle light / dark mode" aria-label="Toggle light or dark mode">🌙</button>
 
 <div class="wrap" id="loginView" style="display:none">
   <div class="brand">
@@ -188,6 +220,20 @@ const API = "https://lf-label-printer.david-pedersen.workers.dev";
 
 let TOKEN = localStorage.getItem("lnf_token") || null;
 let SETTINGS = { prefix: "26", maxQuantity: 100, maxLabelNumber: 9999 };
+
+function toggleTheme() {
+  const isLight = document.documentElement.getAttribute("data-theme") === "light";
+  setTheme(isLight ? "dark" : "light");
+}
+function setTheme(mode) {
+  if (mode === "light") document.documentElement.setAttribute("data-theme", "light");
+  else document.documentElement.removeAttribute("data-theme");
+  try { localStorage.setItem("lnf_theme", mode); } catch (e) {}
+  const btn = document.getElementById("themeToggle");
+  if (btn) btn.textContent = mode === "light" ? "☀️" : "🌙";
+}
+// Sync the toggle icon with whatever the pre-paint script applied.
+setTheme(document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark");
 
 function pad2(n) { return String(n).padStart(2, "0"); }
 function pad4(n) { return String(n).padStart(4, "0"); }
