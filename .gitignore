@@ -1,1 +1,14 @@
-".wrangler/" 
+# The quotes on the original .wrangler entry made it a literal filename match,
+# so it never actually ignored anything.
+.wrangler/
+__pycache__/
+
+# Holds the poller key in plaintext. run_poller.example.bat is the committed
+# template; the real one never leaves the print server.
+run_poller.bat
+
+# Written before each print so a job interrupted mid-print is not silently lost.
+state/
+
+# Local backup copies
+*.bak

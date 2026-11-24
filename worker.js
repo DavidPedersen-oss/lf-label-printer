@@ -23,6 +23,11 @@ const DEFAULT_SETTINGS = {
   siteTitle: "Lost & Found Label Printer",
 };
 
+// Designer jobs carry rendered PNGs. 1-bit label art is ~10-60 KB per label,
+// dithered photos more; 12 MB covers 100 labels with room to spare and stays
+// well under the 25 MiB KV value limit.
+const MAX_IMAGE_JOB_BYTES = 12 * 1024 * 1024;
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
@@ -123,7 +128,7 @@ export default {
       }
       const token = randomToken();
       await env.LNF_SETTINGS.put(`session:${token}`, JSON.stringify({ role: "user" }), {
-        expirationTtl: 60 * 60 * 12, // 12 hours
+        expirationTtl: 60 * 60 * 24 * 365, // 1 year -- staff stay logged in
       });
       return json({ success: true, token });
     }
@@ -203,6 +208,79 @@ export default {
       await addToPendingQueue(env, jobId);
 
       return json({ success: true, jobId, message: "Print job queued." });
+    }
+
+    // ---- Submit a designer (image) print job ----
+    // The designer page renders every label to a 300 dpi black/white PNG in
+    // the browser, so the poller just prints bitmaps. Images live under their
+    // own key so /api/jobs/pending stays tiny on every 4s poll.
+    if (path === "/api/print-image" && request.method === "POST") {
+      const session = await requireSession(request, env);
+      if (!session) return json({ error: "Not authenticated." }, 401);
+
+      const raw = await request.text();
+      if (raw.length > MAX_IMAGE_JOB_BYTES) {
+        return json({ success: false, error: "Job is too large. Print fewer labels at once or use smaller photos." }, 413);
+      }
+      let body;
+      try { body = JSON.parse(raw); } catch (e) { return json({ success: false, error: "Bad request." }, 400); }
+
+      const settings = await getSettings(env);
+      const images = Array.isArray(body.images) ? body.images : [];
+      const copies = parseInt(body.copies, 10) || 1;
+      if (!images.length) return json({ success: false, error: "No labels to print." }, 400);
+      if (copies < 1 || images.length * copies > settings.maxQuantity) {
+        return json({ success: false, error: `Total labels must be 1-${settings.maxQuantity}.` }, 400);
+      }
+      if (!images.every((s) => typeof s === "string" && s.startsWith("data:image/png;base64,"))) {
+        return json({ success: false, error: "Labels must be PNG images." }, 400);
+      }
+
+      const m = body.media || {};
+      const media = {
+        id: String(m.id || "custom").slice(0, 20),
+        name: String(m.name || "").slice(0, 80),
+        tapeMm: Number(m.tapeMm) || 0,
+        lengthMm: Number(m.lengthMm) || 0,
+        continuous: !!m.continuous,
+        portrait: !!m.portrait,
+      };
+
+      const jobId = randomToken(12);
+      const job = {
+        id: jobId,
+        type: "image",
+        count: images.length,
+        copies,
+        quantity: images.length * copies,
+        media,
+        design: String(body.design || "").slice(0, 60),
+        first: body.first ? String(body.first).slice(0, 20) : null,
+        last: body.last ? String(body.last).slice(0, 20) : null,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+      };
+
+      // Images first, then the job record, then the queue -- the poller can
+      // never see a job whose images are missing.
+      await env.LNF_JOBS.put(`jobimg:${jobId}`, JSON.stringify(images), { expirationTtl: 60 * 60 * 24 });
+      await env.LNF_JOBS.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 60 * 60 * 24 });
+      await addToPendingQueue(env, jobId);
+
+      return json({ success: true, jobId, message: "Print job queued." });
+    }
+
+    // ---- Poller: fetch the rendered images for a designer job ----
+    if (path.match(/^\/api\/jobs\/[a-f0-9]+\/images$/) && request.method === "GET") {
+      const key = request.headers.get("X-Poller-Key");
+      const settings = await getSettings(env);
+      if (key !== settings.pollerApiKey) return json({ error: "Invalid poller key." }, 403);
+      const jobId = path.split("/")[3];
+      const raw = await env.LNF_JOBS.get(`jobimg:${jobId}`);
+      if (!raw) return json({ error: "Images not found (expired?)." }, 404);
+      return new Response(`{"success":true,"images":${raw}}`, {
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
     }
 
     // ---- Poller: heartbeat (lets the admin panel show poller health) ----

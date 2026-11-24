@@ -1,326 +1,406 @@
 """
 CSULB Lost & Found -- Label Print Poller
-==========================================
+========================================
+
 Runs on the print server. Polls the Cloudflare Worker for queued print jobs
-submitted from the hosted web form, then automates P-touch Editor exactly
-like before -- no local web server, no firewall/VLAN issues.
+submitted from the hosted web form, and drives the Brother QL-1050 directly.
 
-Setup:
-    pip install requests pyautogui pygetwindow pywin32 psutil
+Nothing about the Worker, the KV queue, the web form, or the passwords changed.
+This file talks to exactly the same endpoints as before. What changed is how a
+job gets printed.
 
-Run:
-    python label_poller.py
+WHAT THIS REPLACES
+------------------
+The previous version opened `Item Code Layout (1).lbx` in P-touch Editor,
+rewrote a CSV the template was linked to, sent Ctrl+P as simulated keystrokes,
+hunted the print dialog for a button called "All Records", clicked it, waited
+four seconds, and reported success.
+
+Every step there is a guess about the state of somebody else's GUI:
+
+  * a screensaver, a Windows update toast, or a colleague clicking anything
+    steals focus, and the keystrokes land in the wrong window;
+  * P-touch takes eight seconds to load on a good day and longer under load,
+    so the fixed sleep either wasted time or fired early;
+  * the CSV is one file lock away from failing, which is why it needed six
+    retries;
+  * and worst of all, clicking Print is not evidence that anything printed.
+    A printer that was off, jammed, or out of tape produced a queue full of
+    completed jobs and a counter with no labels on it.
+
+None of that exists now. There is no GUI, no template, no CSV, no P-touch
+Editor process, and no focus to steal. `ql_raster` renders the label, builds
+Brother raster commands, and hands them to the Windows spooler in RAW mode --
+and a job is only reported complete once the spooler says the job left the
+queue without an error. Anything else is reported as a failure with a sentence
+someone at the printer can act on.
+
+INSTALL
+-------
+    pip install requests pillow pywin32
+
+    (pyautogui, pygetwindow and psutil are no longer needed. So is P-touch
+     Editor -- this does not use it, and does not care whether it is installed.)
+
+CONFIGURE
+---------
+Copy run_poller.example.bat to run_poller.bat and fill in the three values:
+
+    LNF_WORKER_URL, LNF_POLLER_KEY, LNF_PRINTER
+
+The poller key is a secret and does NOT belong in this file -- it would be
+committed. The Worker URL defaults to the real one and is not secret.
+
+RUN
+---
+    python label_poller.py                  poll forever
+    python label_poller.py --list-printers  show what Windows can see
+    python label_poller.py --preview x.png  render a sample label to a PNG
+    python label_poller.py --selftest       print one real sample label
+    python label_poller.py --once           drain the queue once and exit
 """
 
-import time, os, logging, sys
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+
 import requests
-import pyautogui, psutil
-import win32gui, win32con
+
+from ql_raster import (
+    LABEL_LENGTH_DOTS,
+    MEDIA_NAME,
+    PRINTABLE_DOTS,
+    PrinterError,
+    build_job,
+    check_printer,
+    list_printers,
+    render_label,
+    send_raw,
+)
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-WORKER_URL    = "https://lnf-labels-api.YOUR-SUBDOMAIN.workers.dev"
-POLLER_KEY    = "change-me-poller-key"     # Must match pollerApiKey in admin panel
-TEMPLATE_PATH = r"C:\Users\1\Desktop\Item Code Layout (1).lbx"
-PTOUCH_CSV    = r"C:\Users\1\Desktop\p_touch_clean_database.csv"
-POLL_INTERVAL = 4   # seconds between checks
+WORKER_URL = os.environ.get(
+    "LNF_WORKER_URL", "https://lf-label-printer.david-pedersen.workers.dev"
+).rstrip("/")
+POLLER_KEY = os.environ.get("LNF_POLLER_KEY", "change-me-poller-key")
+PRINTER = os.environ.get("LNF_PRINTER", "Brother QL-1050")
+POLL_INTERVAL = float(os.environ.get("LNF_POLL_INTERVAL", "4"))
+# The Worker stores poller:lastSeen with a 30-minute TTL, so a heartbeat only
+# has to beat that. It was hardcoded to 30 SECONDS, which is 2,880 KV writes a
+# day against a free-tier limit of 1,000 -- the quota was gone by mid-morning.
+HEARTBEAT_INTERVAL = float(os.environ.get("LNF_HEARTBEAT_INTERVAL", "600"))
+
+# After a failure, wait before printing again. The failures worth retrying --
+# cover open, roll finished, printer switched off -- take a person a few seconds
+# to fix, and hammering the queue in the meantime just fills the log.
+RETRY_PAUSE_SECONDS = 20
+
+# The in-flight job is written here BEFORE any byte reaches the printer, so a
+# power cut mid-print is reported as an unknown outcome rather than forgotten.
+STATE_DIR = Path(os.environ.get("LNF_STATE_DIR", Path(__file__).resolve().parent / "state"))
+
+POLLER_VERSION = "2.0.0"
 # ─────────────────────────────────────────────────────────────────────────────
 
-pyautogui.FAILSAFE = False
-
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 log = logging.getLogger("LabelPoller")
 
 
-_last_conn_state = {"ok": True, "last_logged": 0, "fail_count": 0}
+# ── talking to the Worker ──────────────────────────────────────────────────
 
-def fetch_pending_jobs():
+_conn = {"online": True, "failures": 0, "down_since": 0.0, "last_repeat": 0.0}
+
+
+def _note_connection(ok: bool, error: str = "") -> None:
+    """
+    Log connection state on transition, not on every failed poll.
+
+    The print server's network drops intermittently. A line every four seconds
+    is a log nobody reads, so an outage is logged once when it starts, once
+    every five minutes while it lasts, and once when it clears -- with how long
+    it lasted, which is the only part anyone ever wants.
+    """
+    now = time.monotonic()
+    if ok:
+        if not _conn["online"]:
+            log.info("Reconnected to the Worker after %.0fs offline (%d failed polls).",
+                     now - _conn["down_since"], _conn["failures"])
+        _conn["online"], _conn["failures"] = True, 0
+        return
+    _conn["failures"] += 1
+    if _conn["online"]:
+        log.error("Lost connection to the Worker: %s", error)
+        _conn.update(online=False, down_since=now, last_repeat=now)
+    elif now - _conn["last_repeat"] > 300:
+        log.warning("Still offline (%d failed polls so far): %s", _conn["failures"], error)
+        _conn["last_repeat"] = now
+
+
+def _headers() -> dict:
+    return {"X-Poller-Key": POLLER_KEY, "Content-Type": "application/json"}
+
+
+def fetch_pending_jobs() -> list[dict]:
     try:
-        r = requests.get(
-            f"{WORKER_URL}/api/jobs/pending",
-            headers={"X-Poller-Key": POLLER_KEY},
-            timeout=10,
-        )
+        r = requests.get(f"{WORKER_URL}/api/jobs/pending", headers=_headers(), timeout=10)
         if r.status_code != 200:
-            _note_connection(False, f"HTTP {r.status_code}: {r.text}")
+            _note_connection(False, f"HTTP {r.status_code}: {r.text[:200]}")
             return []
-        data = r.json()
         _note_connection(True)
-        return data.get("jobs", [])
-    except Exception as e:
-        _note_connection(False, str(e))
+        return r.json().get("jobs", [])
+    except Exception as exc:
+        _note_connection(False, str(exc))
         return []
 
 
-def _note_connection(ok, error=None):
-    """Log connection state transitions instead of spamming every failed
-    poll -- the print server's network drops intermittently, so this keeps
-    the log readable while still recording how long an outage lasted."""
-    now = time.time()
-    if ok:
-        if not _last_conn_state["ok"]:
-            down_for = now - _last_conn_state["last_logged"]
-            log.info(f"Reconnected to Worker after {down_for:.0f}s offline "
-                      f"({_last_conn_state['fail_count']} failed polls).")
-        _last_conn_state["ok"] = True
-        _last_conn_state["fail_count"] = 0
-    else:
-        _last_conn_state["fail_count"] += 1
-        if _last_conn_state["ok"]:
-            # Just went down -- log immediately.
-            log.error(f"Lost connection to Worker: {error}")
-            _last_conn_state["last_logged"] = now
-            _last_conn_state["ok"] = False
-        elif now - _last_conn_state.get("_last_repeat_log", 0) > 300:
-            # Still down -- only re-log every 5 minutes to avoid spam.
-            log.warning(f"Still offline ({_last_conn_state['fail_count']} "
-                        f"failed polls so far): {error}")
-            _last_conn_state["_last_repeat_log"] = now
-
-
-def send_heartbeat():
-    """Let the Worker know the poller is alive so the admin panel can show
-    real status instead of leaving Dave guessing whether it's running."""
+def send_heartbeat() -> None:
+    """Tell the admin panel the poller is alive, so nobody has to guess."""
     try:
-        requests.post(
-            f"{WORKER_URL}/api/poller/heartbeat",
-            headers={"X-Poller-Key": POLLER_KEY},
-            timeout=8,
-        )
+        requests.post(f"{WORKER_URL}/api/poller/heartbeat", headers=_headers(), timeout=8)
     except Exception:
-        pass  # Heartbeat failures aren't critical -- next poll will retry.
+        pass   # Not critical -- the next poll retries.
 
 
-def mark_complete(job_id):
-    try:
-        requests.post(
-            f"{WORKER_URL}/api/jobs/{job_id}/complete",
-            headers={"X-Poller-Key": POLLER_KEY},
-            timeout=10,
-        )
-    except Exception as e:
-        log.error(f"Failed to mark job complete: {e}")
+def _report(path: str, payload: dict | None = None) -> bool:
+    """
+    Report an outcome, retrying hard.
 
-
-def mark_failed(job_id, error):
-    try:
-        requests.post(
-            f"{WORKER_URL}/api/jobs/{job_id}/fail",
-            headers={"X-Poller-Key": POLLER_KEY},
-            json={"error": str(error)},
-            timeout=10,
-        )
-    except Exception as e:
-        log.error(f"Failed to mark job failed: {e}")
-
-
-def write_csv(rcv_fmt, exp_fmt, prefix, start, quantity, retries=6, delay=1.0):
-    lines = ["Exp Date,Code,ReceivedDate"]
-    for i in range(quantity):
-        code = f"{prefix}-{str(start + i).zfill(4)}"
-        lines.append(f"{exp_fmt},{code},{rcv_fmt}")
-    content = "\r\n".join(lines) + "\r\n"
-
-    last_err = None
-    for attempt in range(1, retries + 1):
+    This is the one call that must not be lost: a job whose outcome never
+    arrives sits pending and prints again on the next poll, which is how you end
+    up with the same label twice.
+    """
+    for attempt in range(5):
         try:
-            with open(PTOUCH_CSV, "w", newline="") as f:
-                f.write(content)
-            log.info(f"CSV written: {quantity} row(s)  |  {prefix}-{str(start).zfill(4)} to {prefix}-{str(start+quantity-1).zfill(4)}")
-            return
-        except PermissionError as e:
-            last_err = e
-            log.warning(f"CSV locked (attempt {attempt}/{retries}), retrying in {delay}s...")
-            time.sleep(delay)
-    raise RuntimeError(f"Could not write CSV after {retries} attempts: {last_err}")
+            requests.post(f"{WORKER_URL}{path}", headers=_headers(),
+                          json=payload or {}, timeout=10).raise_for_status()
+            return True
+        except Exception as exc:
+            log.warning("Could not report outcome (attempt %d/5): %s", attempt + 1, exc)
+            time.sleep(min(2 ** attempt, 15))
+    log.error("Gave up reporting %s.", path)
+    return False
 
 
-def kill_ptouch():
-    for proc in psutil.process_iter(['name', 'pid']):
-        if 'ptedit' in proc.info['name'].lower():
-            log.info(f"Closing existing P-touch (PID {proc.info['pid']})")
-            proc.terminate()
-            try: proc.wait(timeout=3)
-            except: proc.kill()
-    time.sleep(1)
+def mark_complete(job_id: str) -> bool:
+    return _report(f"/api/jobs/{job_id}/complete")
 
 
-def find_ptouch_hwnd(timeout=15):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        found = []
-        def cb(h, _):
-            t = win32gui.GetWindowText(h)
-            if "p-touch" in t.lower() or "ptouch" in t.lower():
-                found.append(h)
-        win32gui.EnumWindows(cb, None)
-        if found:
-            return found[0]
-        time.sleep(0.5)
-    return None
+def mark_failed(job_id: str, error) -> bool:
+    return _report(f"/api/jobs/{job_id}/fail", {"error": str(error)})
 
 
-def focus_window(hwnd):
-    import ctypes
-    user32   = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    fg_hwnd = user32.GetForegroundWindow()
-    fg_tid  = user32.GetWindowThreadProcessId(fg_hwnd, None)
-    my_tid  = kernel32.GetCurrentThreadId()
-    if fg_tid and fg_tid != my_tid:
-        user32.AttachThreadInput(fg_tid, my_tid, True)
-    user32.ShowWindow(hwnd, 9)
-    user32.BringWindowToTop(hwnd)
-    user32.SetForegroundWindow(hwnd)
-    if fg_tid and fg_tid != my_tid:
-        user32.AttachThreadInput(fg_tid, my_tid, False)
-    time.sleep(0.4)
+# ── the in-flight record ───────────────────────────────────────────────────
+
+def _state_path() -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return STATE_DIR / "in-flight.json"
 
 
-def automate_print():
-    log.info(f"Opening template: {TEMPLATE_PATH}")
-    os.startfile(TEMPLATE_PATH)
-
-    log.info("Waiting for P-touch Editor to load (8s)...")
-    time.sleep(8)
-
-    hwnd = find_ptouch_hwnd(timeout=10)
-    if not hwnd or not win32gui.IsWindow(hwnd):
-        raise RuntimeError("P-touch Editor did not open in time.")
-
-    log.info(f"Window ready: '{win32gui.GetWindowText(hwnd)}'")
-    focus_window(hwnd)
-
-    pyautogui.hotkey("ctrl", "p")
-    log.info("Sent Ctrl+P, waiting for print dialog...")
-    time.sleep(2.5)
-
-    print_dlg = None
-    for _ in range(20):
-        print_dlg = win32gui.FindWindow(None, "Print")
-        if print_dlg:
-            break
-        time.sleep(0.3)
-
-    if print_dlg:
-        buttons = []
-        def enum_cb(h, _):
-            cls  = win32gui.GetClassName(h)
-            text = win32gui.GetWindowText(h)
-            if cls == "Button":
-                buttons.append((h, text))
-        win32gui.EnumChildWindows(print_dlg, enum_cb, None)
-
-        all_records_hwnd = None
-        print_btn_hwnd   = None
-        for h, text in buttons:
-            clean = text.replace('&', '').lower()
-            if clean.startswith('all records'):
-                all_records_hwnd = h
-            if clean == 'print':
-                print_btn_hwnd = h
-
-        if all_records_hwnd:
-            log.info("Clicking All Records...")
-            win32api = __import__("win32api")
-            win32api.SendMessage(all_records_hwnd, win32con.BM_CLICK, 0, 0)
-            time.sleep(0.3)
-        else:
-            log.warning("All Records button not found: " + str([t for _, t in buttons]))
-
-        if print_btn_hwnd:
-            log.info("Clicking Print...")
-            win32api = __import__("win32api")
-            win32api.SendMessage(print_btn_hwnd, win32con.BM_CLICK, 0, 0)
-        else:
-            pyautogui.press("enter")
-    else:
-        # Retry once rather than blindly pressing Enter on an unknown window --
-        # a stray Enter could hit the wrong control and silently under-print.
-        log.warning("Print dialog not found on first try, retrying Ctrl+P once...")
-        pyautogui.hotkey("ctrl", "p")
-        time.sleep(3)
-        print_dlg = win32gui.FindWindow(None, "Print")
-        if print_dlg:
-            buttons = []
-            def enum_cb2(h, _):
-                if win32gui.GetClassName(h) == "Button":
-                    buttons.append((h, win32gui.GetWindowText(h)))
-            win32gui.EnumChildWindows(print_dlg, enum_cb2, None)
-            all_h = next((h for h, t in buttons if t.replace('&','').lower().startswith('all records')), None)
-            print_h = next((h for h, t in buttons if t.replace('&','').lower() == 'print'), None)
-            win32api = __import__("win32api")
-            if all_h:
-                win32api.SendMessage(all_h, win32con.BM_CLICK, 0, 0)
-                time.sleep(0.3)
-            if print_h:
-                win32api.SendMessage(print_h, win32con.BM_CLICK, 0, 0)
-            else:
-                raise RuntimeError("Print dialog reappeared but Print button not found -- aborting rather than guessing.")
-        else:
-            raise RuntimeError("Print dialog never appeared after two attempts -- job not printed.")
-
-    time.sleep(4)
-
-    hwnd = find_ptouch_hwnd(timeout=3)
-    if hwnd and win32gui.IsWindow(hwnd):
-        focus_window(hwnd)
-        pyautogui.hotkey("alt", "f4")
-        time.sleep(1)
-        save_hwnd = find_ptouch_hwnd(timeout=2)
-        if save_hwnd:
-            pyautogui.press("n")
-
-    log.info("Print cycle complete.")
+def mark_in_flight(job: dict, codes: list[str]) -> None:
+    _state_path().write_text(json.dumps({
+        "id": job["id"], "codes": codes,
+        "startedAt": datetime.now().isoformat(timespec="seconds"),
+    }), encoding="utf-8")
 
 
-def process_job(job):
-    job_id = job["id"]
-    log.info(f"Processing job {job_id}: {job['quantity']} label(s)")
+def clear_in_flight() -> None:
+    path = _state_path()
+    if path.exists():
+        path.unlink()
+
+
+def recover_in_flight() -> None:
+    """
+    Report a job the previous run died in the middle of.
+
+    Without this the job stays pending in KV and prints again on the next poll,
+    with no way to tell whether the first attempt produced labels. Saying "we
+    don't know, check the roll" is worth more than silently doing it twice.
+    """
+    path = _state_path()
+    if not path.exists():
+        return
     try:
-        y, m, d = job["rcv"].split("-")
-        rcv_fmt = f"{int(m)}/{int(d)}/{y}"
-        ey, em, ed = job["exp"].split("-")
-        exp_fmt = f"{int(em)}/{int(ed)}/{ey}"
-
-        # Kill any lingering P-touch instance FIRST so it releases the CSV
-        # file lock before we try to write to it (fixes intermittent
-        # PermissionError when jobs land back-to-back).
-        kill_ptouch()
-        write_csv(rcv_fmt, exp_fmt, job["prefix"], job["start"], job["quantity"])
-        automate_print()
-        mark_complete(job_id)
-        log.info(f"Job {job_id} complete.")
-    except Exception as e:
-        log.error(f"Job {job_id} failed: {e}")
-        mark_failed(job_id, e)
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        path.unlink()
+        return
+    log.error("Found job %s left in flight from %s -- the poller stopped mid-print.",
+              record.get("id"), record.get("startedAt"))
+    mark_failed(record.get("id", ""), (
+        "The poller stopped while this job was printing, so it is not known whether "
+        "the labels came out. Check the printer before printing this range again."
+    ))
+    path.unlink()
 
 
-def main():
-    log.info("=" * 55)
-    log.info("CSULB Lost & Found Label Poller")
-    log.info(f"Worker   : {WORKER_URL}")
-    log.info(f"Template : {TEMPLATE_PATH}")
-    log.info(f"Poll every {POLL_INTERVAL}s")
-    log.info("=" * 55)
+# ── jobs ───────────────────────────────────────────────────────────────────
 
-    last_heartbeat = 0
+def job_labels(job: dict) -> list[dict]:
+    """
+    Turn the Worker's job into the labels to print.
+
+    The Worker sends a starting number and a quantity, exactly as it always
+    has -- {prefix: "26", start: 1179, quantity: 10, rcv: "2026-08-31",
+    exp: "2026-09-30"} -- so nothing on that side needs redeploying.
+    """
+    prefix = str(job.get("prefix", "26"))
+    start = int(job["start"])
+    quantity = int(job["quantity"])
+    return [
+        {
+            "code": f"{prefix}-{start + i:04d}",
+            "receivedOn": job.get("rcv", ""),
+            "expiresOn": job.get("exp", ""),
+        }
+        for i in range(quantity)
+    ]
+
+
+def process_job(job: dict) -> bool:
+    """Print one job. Returns True if it printed."""
+    job_id = job["id"]
+    try:
+        labels = job_labels(job)
+    except (KeyError, TypeError, ValueError) as exc:
+        log.error("Job %s is malformed: %s", job_id, exc)
+        mark_failed(job_id, f"The job was malformed: {exc}")
+        return False
+
+    if not labels:
+        mark_failed(job_id, "The job contained no labels.")
+        return False
+
+    codes = [label["code"] for label in labels]
+    span = codes[0] if len(codes) == 1 else f"{codes[0]} to {codes[-1]}"
+    log.info("Job %s: %d label(s), %s", job_id, len(labels), span)
+
+    mark_in_flight(job, codes)
+    try:
+        data = build_job(labels)
+        detail = send_raw(PRINTER, data, f"L&F labels {span}")
+    except PrinterError as exc:
+        clear_in_flight()
+        log.error("Job %s failed: %s", job_id, exc)
+        mark_failed(job_id, str(exc))
+        return False
+    except Exception as exc:
+        clear_in_flight()
+        log.exception("Job %s failed unexpectedly.", job_id)
+        mark_failed(job_id, f"{type(exc).__name__}: {exc}")
+        return False
+
+    clear_in_flight()
+    log.info("Job %s done -- %s (%d bytes).", job_id, detail, len(data))
+    mark_complete(job_id)
+    return True
+
+
+# ── the loop ───────────────────────────────────────────────────────────────
+
+def main_loop(once: bool = False) -> None:
+    recover_in_flight()
+    last_heartbeat = 0.0
+
     while True:
         jobs = fetch_pending_jobs()
-        for job in jobs:
-            process_job(job)
+        printed = all(process_job(job) for job in jobs) if jobs else True
 
-        # Heartbeat every ~30s, not every poll cycle -- keeps it lightweight.
-        if time.time() - last_heartbeat > 30:
+        if time.monotonic() - last_heartbeat > HEARTBEAT_INTERVAL:
             send_heartbeat()
-            last_heartbeat = time.time()
+            last_heartbeat = time.monotonic()
 
-        time.sleep(POLL_INTERVAL)
+        if once and not jobs:
+            return
+        if not jobs:
+            time.sleep(POLL_INTERVAL)
+        elif not printed:
+            log.info("Pausing %ds before trying again.", RETRY_PAUSE_SECONDS)
+            time.sleep(RETRY_PAUSE_SECONDS)
+
+
+# ── entry point ────────────────────────────────────────────────────────────
+
+SAMPLE = {
+    "code": "26-8888",
+    "receivedOn": date.today().isoformat(),
+    "expiresOn": date.today().replace(day=28).isoformat(),
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="CSULB Lost & Found label poller (Brother QL-1050).")
+    parser.add_argument("--list-printers", action="store_true",
+                        help="show the printers Windows can see, then exit")
+    parser.add_argument("--preview", metavar="FILE.png",
+                        help="render a sample label to a PNG instead of printing")
+    parser.add_argument("--dump", metavar="FILE.prn",
+                        help="write the raw printer bytes for a sample label")
+    parser.add_argument("--selftest", action="store_true",
+                        help="print one real sample label and exit")
+    parser.add_argument("--once", action="store_true",
+                        help="drain the queue once and exit, instead of polling")
+    args = parser.parse_args(argv)
+
+    if args.list_printers:
+        for name in list_printers():
+            print(name)
+        return 0
+
+    # These need no Worker credentials on purpose: proving the artwork and the
+    # byte stream are right should not require a working network.
+    if args.preview:
+        render_label(SAMPLE["code"], SAMPLE["receivedOn"], SAMPLE["expiresOn"]).save(args.preview)
+        print(f"Wrote {args.preview} "
+              f"({PRINTABLE_DOTS} x {LABEL_LENGTH_DOTS} dots, {MEDIA_NAME}).")
+        return 0
+
+    if args.dump:
+        data = build_job([SAMPLE])
+        Path(args.dump).write_bytes(data)
+        print(f"Wrote {args.dump} ({len(data)} bytes).")
+        return 0
+
+    if args.selftest:
+        try:
+            detail = send_raw(PRINTER, build_job([SAMPLE]), "L&F self-test")
+        except PrinterError as exc:
+            print(f"FAILED: {exc}")
+            return 1
+        print(f"OK: {detail}")
+        return 0
+
+    if POLLER_KEY == "change-me-poller-key":
+        print("Set LNF_POLLER_KEY to the Poller API Key from the admin panel "
+              "(/admin.html). Copy run_poller.example.bat to run_poller.bat and "
+              "fill it in there.", file=sys.stderr)
+        return 2
+
+    log.info("=" * 62)
+    log.info("CSULB Lost & Found label poller %s", POLLER_VERSION)
+    log.info("Worker   : %s", WORKER_URL)
+    log.info("Printer  : %s", PRINTER)
+    log.info("Media    : %s, %d dots long", MEDIA_NAME, LABEL_LENGTH_DOTS)
+    log.info("Polling every %.0fs", POLL_INTERVAL)
+    log.info("=" * 62)
+
+    try:
+        main_loop(once=args.once)
+    except KeyboardInterrupt:
+        log.info("Stopped.")
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        log.info("Stopped.")
+    raise SystemExit(main())
